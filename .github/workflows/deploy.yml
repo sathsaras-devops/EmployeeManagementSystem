@@ -1,0 +1,106 @@
+name: Deploy to IIS
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment to deploy
+        required: true
+        type: choice
+        options:
+          - DEV
+          - QA
+          - SIT
+          - PARTNER
+          - PROD
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  find-build:
+    name: Find latest successful DEV build
+    runs-on: ubuntu-latest
+    outputs:
+      run_id: ${{ steps.find-run.outputs.run_id }}
+
+    steps:
+      - name: Find latest successful build
+        id: find-run
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const response = await github.rest.actions.listWorkflowRuns({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'build.yml',
+              branch: 'DEV',
+              event: 'push',
+              status: 'success',
+              per_page: 1
+            });
+
+            if (response.data.workflow_runs.length === 0) {
+              core.setFailed('No successful build.yml run was found for the DEV branch.');
+              return;
+            }
+
+            const run = response.data.workflow_runs[0];
+            core.info(`Using build run ${run.id} from commit ${run.head_sha}.`);
+            core.setOutput('run_id', run.id.toString());
+
+  deploy:
+    name: Deploy to ${{ inputs.environment }}
+    needs: find-build
+    runs-on: [self-hosted, windows, "${{ inputs.environment }}"]
+    environment:
+      name: ${{ inputs.environment }}
+
+    steps:
+      - name: Download deployment artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: employee-management-api
+          path: ./artifact
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.find-build.outputs.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Deploy package to IIS
+        shell: pwsh
+        env:
+          IIS_SITE_PATH: ${{ vars.IIS_SITE_PATH }}
+          IIS_APP_POOL: ${{ vars.IIS_APP_POOL }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          if ([string]::IsNullOrWhiteSpace($env:IIS_SITE_PATH)) {
+            throw 'IIS_SITE_PATH is not configured for this GitHub Environment.'
+          }
+
+          if ([string]::IsNullOrWhiteSpace($env:IIS_APP_POOL)) {
+            throw 'IIS_APP_POOL is not configured for this GitHub Environment.'
+          }
+
+          $package = Join-Path $PWD 'artifact\employee-management-api.zip'
+          $extractPath = Join-Path $PWD 'extracted'
+
+          if (-not (Test-Path -LiteralPath $package)) {
+            throw "Deployment package was not found: $package"
+          }
+
+          Import-Module WebAdministration
+          New-Item -ItemType Directory -Path $extractPath -Force | Out-Null
+          Expand-Archive -LiteralPath $package -DestinationPath $extractPath -Force
+
+          Stop-WebAppPool -Name $env:IIS_APP_POOL
+
+          if (-not (Test-Path -LiteralPath $env:IIS_SITE_PATH)) {
+            New-Item -ItemType Directory -Path $env:IIS_SITE_PATH -Force | Out-Null
+          }
+
+          Get-ChildItem -LiteralPath $env:IIS_SITE_PATH -Force | Remove-Item -Recurse -Force
+          Copy-Item -Path (Join-Path $extractPath '*') -Destination $env:IIS_SITE_PATH -Recurse -Force
+
+          Start-WebAppPool -Name $env:IIS_APP_POOL
